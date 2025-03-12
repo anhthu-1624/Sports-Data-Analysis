@@ -1,0 +1,1270 @@
+---
+title: "Project"
+author: "Nhóm 20"
+date: "2025-01-08"
+output: html_document
+---
+
+# Nhóm 20
+Các thành viên:<br>
+1. Nguyễn Hoàng Yến Nhi - 21110358 <br>
+2. Lê Đặng Gia Khánh - 22110081 <br>
+3. Phạm Đăng Quang - 22110177  <br>
+4. Trần Anh Quốc - 22110178  
+5. Nguyễn Quốc Tài - 22110190  
+6. Phạm Thị Anh Thư - 22110215
+ 
+# Import thư viện cần thiết
+```{r}
+library(tidyverse)
+library(janitor)
+library(ggplot2)
+library(stringr)
+library(dplyr)
+library(VIM)
+library(lmPerm)
+library(effectsize)
+library(rcompanion)
+library(boot)
+library(leaps)
+library(car)
+library(glmnet)
+library(nnet)
+library(scales)
+```
+# Mở cửa sổ đồ họa lớn hơn
+```{r}
+options(repr.plot.width = 60, repr.plot.height = 20)
+
+```
+
+# 1. Tiền xử lý dữ liệu
+
+## 1.1 Load dữ liệu
+```{r}
+#Load data
+data <- read.csv("fifa_eda_stats.csv", na = c("", "NA", "N/A"))
+# Chỉnh tên cột về dạng chuẩn và đồng thời hiện thị data
+data <- data|> clean_names()
+glimpse(data)
+
+```
+## 1.2 Kiểm tra số dữ liệu bị null
+
+```{r}
+sum(is.na(data))
+```
+## 1.3 Kiểm tra dòng bị duplicate
+```{r}
+sum(duplicated(data)) 
+```
+
+
+## 1.4 Chỉnh lại tên cột và kiểu dữ liệu
+### 1.4.1 Chỉnh lại các cột bị sai định dạng vì có ký hiệu tiền tệ
+```{r, warning = FALSE}
+data <- data |>
+    mutate(
+        wage = gsub("€", "", wage),
+        wage = gsub("K", "", wage),
+        wage = as.numeric(wage) * 1000
+    )
+
+
+
+data <- data |>
+    mutate(
+        value = as.character(value),
+        value = gsub("€", "", value),
+        value = case_when(
+            grepl("K", value) ~ as.numeric(gsub("K", "", value)) * 1000,
+            grepl("M", value) ~ as.numeric(gsub("M", "", value)) * 1000000,
+            TRUE ~ as.numeric(value)
+        )
+    )
+
+
+
+
+data <- data |>
+    mutate(
+        release_clause = as.character(release_clause),
+        release_clause = gsub("€", "", release_clause),
+        release_clause = case_when(
+            grepl("K", release_clause) ~ as.numeric(gsub("K", "", release_clause)) * 1000,
+            grepl("M", release_clause) ~ as.numeric(gsub("M", "", release_clause)) * 1000000,
+            TRUE ~ as.numeric(release_clause)
+        )
+    )
+
+```
+### 1.4.2 Chuyển weight về kg
+```{r, results='hide'}
+data <- data |>
+    mutate(
+        weight = gsub("lbs", "", weight),
+        weight = as.numeric(weight) * 0.453592
+    )  
+```
+### 1.4.3 Chuyển feet, inches sang mét
+```{r, results='hide'}
+data <- data |>
+    mutate(
+        feet = as.numeric(gsub("'.*", "", height)),
+        inches = as.numeric(gsub(".*'", "", height)),
+        height = (feet * 12 + inches) * 0.0254
+    ) |> select(-c(feet, inches))   
+```
+
+### 1.4.4 Chuyển đổi chân thuận về dạng numeric
+```{r, results='hide'}
+data <- data |>
+    mutate(
+      preferred_foot = as.numeric(factor(preferred_foot))-1,
+    )
+```
+### 1.4.5 Đổi tên cột
+```{r, results='hide'}
+data <- data |>
+    rename(
+        wage_k = wage,
+        value_km = value,
+        release_clause_km = release_clause,
+        height_m = height,
+        weight_kg = weight
+    )
+```
+### 1.4.6 Chuyển về định dạng date:
+```{r, results='hide'}
+data <- data|>
+  mutate(
+    joined = case_when( 
+      !is.na(joined) ~ suppressWarnings(mdy(joined)), # Chuyển định dạng với mdy()
+      TRUE ~ NA_Date_ # Giữ nguyên giá trị NA
+    ),
+    contract_valid_until = case_when(
+      !is.na(contract_valid_until) & grepl("^[0-9]{4}$", contract_valid_until) ~ 
+        as.Date(paste0(contract_valid_until, "-01-01")), # Nếu chỉ có năm, thêm -01-01
+      !is.na(contract_valid_until) ~ 
+        as.Date(contract_valid_until, format = "%b %d, %Y"), # Nếu có ngày tháng đầy đủ
+      TRUE ~ NA_Date_ # Giữ nguyên giá trị NA
+    )
+  )
+```
+
+# 2. Tổng hợp dữ liệu
+
+## 2.1 Hiển thị biểu đồ aggr
+```{r}
+aggr(data, 
+     ylab = c("Proportion of missings", "Pattern"), 
+     number = TRUE,
+     cex.axis = 0.6,  
+     cex.numbers = 0.5)
+
+```
+<br><br>
+
+## 2.2 Kiểm tra khuyết dữ liệu
+```{r}
+na_data <- data |> 
+  summarize(na_ratio = sum(is.na(data)) / (n() * ncol(data)))
+na_data
+
+
+```
+- Vì tỷ lệ khuyết khoảng 0.021 < 0.1 nên ta có thể bỏ qua các dữ liệu bị khuyết. <br>
+
+## 2.3 Lọc và phân loại cầu thủ
+```{r}
+all_players <- data |>
+  mutate(position_group = case_when(
+    position %in% c("ST", "RW", "LW", "LF", "CF", "RF", "RS", "LS") ~ "attacker",
+    position %in% c("CAM", "CM", "LM", "RM", "CDM", "RCM", "LCM", "LDM", "LAM", "RDM", "RAM") ~ "midfielder",
+    position %in% c("CB", "RB", "LB", "RWB", "LWB", "RCB", "LCB") ~ "defender",
+    position == "GK" ~ "goalkeeper",
+    TRUE ~ "other"
+  ))
+
+```
+## 2.4 Danh sách chỉ số cần tính toán
+```{r}
+stats_columns <- c(
+  "age", "overall", "potential", "value_m", "wage_k", "height_m", "weight_kg",
+  "crossing", "finishing", "heading_accuracy", "short_passing", "volleys",
+  "dribbling", "curve", "fk_accuracy", "long_passing", "ball_control",
+  "acceleration", "sprint_speed", "agility", "reactions", "balance",
+  "shot_power", "jumping", "stamina", "strength", "long_shots",
+  "aggression", "interceptions", "positioning", "vision", "penalties",
+  "composure", "marking", "standing_tackle", "sliding_tackle", "release_clause_m"
+)
+
+stats_columns_goalkeepers <- c(
+  "age", "overall", "potential", "value_m", "wage_k", "height_m", "weight_kg",
+  "crossing", "short_passing", "long_passing", "acceleration", "sprint_speed", "agility", 
+  "reactions", "balance", "jumping", "stamina", "strength", "vision", "composure", 
+  "gk_diving", "gk_handling", "gk_kicking", "gk_positioning", "gk_reflexes", "release_clause_m"
+)
+
+
+```
+## 2.5 Hàm tính toán thống kê cho từng nhóm
+```{r}
+summarize_stats <- function(data, stats) {
+  data.frame(
+    metric = stats,
+    mean = sapply(stats, function(stat) mean(data[[stat]], na.rm = TRUE)),
+    median = sapply(stats, function(stat) median(data[[stat]], na.rm = TRUE)),
+    max = sapply(stats, function(stat) max(data[[stat]], na.rm = TRUE)),
+    min = sapply(stats, function(stat) min(data[[stat]], na.rm = TRUE))
+  )
+}
+```
+<br><br>
+
+## 2.6 Tóm tắt cho từng nhóm vị trí
+```{r, warning = FALSE}
+valid_stats_columns <- stats_columns[stats_columns %in% colnames(all_players)]
+summary_attackers <- all_players |>
+  filter(position_group == "attacker") |>
+  summarize_stats(valid_stats_columns)
+
+summary_midfielders <- all_players |>
+  filter(position_group == "midfielder") |>
+  summarize_stats(valid_stats_columns)
+
+summary_defenders <- all_players |>
+  filter(position_group == "defender") |>
+  summarize_stats(valid_stats_columns)
+
+summary_goalkeepers <- all_players |>
+  filter(position_group == "goalkeeper") |>
+  summarize_stats(valid_stats_columns)
+
+```
+## 2.7 In kết quả
+```{r}
+print(summary_attackers)
+print(summary_midfielders)
+print(summary_defenders)
+print(summary_goalkeepers)
+```
+# 3. Trực quan hóa dữ liệu
+
+## 3.1 Biểu đồ phân phối tuổi của cầu thủ
+```{r}
+data |> ggplot(aes(x = age)) +
+  geom_histogram(bins = 20, fill = "skyblue", color = "black") +
+  labs(title = "Phân Phối Tuổi Của Cầu Thủ", x = "Tuổi", y = "Số lượng") +
+  theme_minimal()
+```
+<br><br>
+
+- Độ tuổi 20-30 là giai đoạn vàng trong sự nghiệp cầu thủ, với số lượng áp đảo so với các nhóm tuổi khác. <br>
+
+## 3.2 Phân bố Giá trị thị trường theo nhóm tuổi
+```{r}
+data$age_group <- cut(data$age, 
+                        breaks = c(-Inf, 19, 25, 30, Inf),
+                        labels = c("U20", "20_25", "25_30", "30+"),
+                        right = TRUE)
+data |> ggplot(aes(x = age, y = value_km)) +
+  geom_point(aes(color = age_group), alpha = 0.5) +
+  labs(title = "Phân Bố Giá Trị Thị Trường Theo Nhóm Tuổi", x = "Tuổi", y = "Giá trị thị trường (€)") +
+  theme_minimal()
+```
+<br><br>
+
+- Độ tuổi 20-25 là giai đoạn vàng để đầu tư vào cầu thủ bóng đá.Đây là nhóm có giá trị thị trường cao, ROI ổn định, và tiềm năng phát triển lớn. <br>
+- Độ tuổi 30+ phù hợp cho các vai trò vai trò lãnh đạo, hỗ trợ đội hình hoặc chiến lược ngắn hạn. <br>
+- Đầu tư vào nhóm U20 nên được xem như một chiến lược dài hạn và có chọn lọc. <br>
+
+## 3.3 Tính chỉ số roi (giá trị mang lại của cầu thủ)
+```{r}
+data$roi <- (data$potential + data$overall) / (data$value_km + data$wage_k) * 100
+data_filt <- data |> filter(value_km > 0 & roi < quantile(roi, 0.99))
+```
+
+## 3.4 Phân bố ROI theo độ tuổi 
+```{r}
+data |> 
+  filter(!is.na(roi) & roi >= 0 & roi <= 2) |> 
+  ggplot(aes(x = age, y = roi)) +
+  geom_point(aes(color = age_group), alpha = 0.5) +
+  labs(title = "Phân Bố ROI Theo Độ Tuổi", x = "Tuổi", y = "ROI") +
+  theme_minimal() + 
+  ylim(0, 2)
+```
+<br><br>
+
+- ROI giảm dần theo độ tuổi, đặc biệt là ở nhóm tuổi 30, từ 32-33 trở đi có xu hướng tăng nhẹ nhưng sau đó vẫn giảm. <br>
+- Đầu tư vào nhóm U20 và 20-25 tuổi sẽ mang lại ROI cao hơn so với các nhóm tuổi khác, tiềm năng phát triển lớn. <br>
+- ROI ở nhóm 30+ có sự biến động lớn, với một số cầu thủ có ROI cao vượt trội. <br>
+- Cẩn trọng khi đầu tư vào nhóm 30+: Chỉ nên đầu tư vào cầu thủ có vai trò chiến lược hoặc kỹ năng đặc biệt. <br>
+
+## 3.5 So sánh chỉ số overall giữa các chân thuận, lọc na
+```{r}
+data_filt <- data |> filter(!is.na(preferred_foot))
+
+ggplot(data_filt, aes(x = factor(preferred_foot), y = overall, fill = factor(preferred_foot))) +
+  geom_boxplot() +
+  theme_minimal() +
+  labs(
+    title = "So Sánh Chỉ Số Overall giữa Các Chân Thuận",
+    x = "Chân Thuận",
+    y = "Chỉ Số Overall",
+    fill = "Chân Thuận"
+  )
+```
+<br><br>
+
+- Ta có thể thấy trung bình chỉ số overall của cầu thủ thuận chân trái cao hơn so với overall của cầu thủ thuận chân phải. <br>
+
+## 3.6 So sánh performance (khoảng cách giữa tiềm năng và thực lực hiện tại) giữa các nhóm tuổi
+```{r}
+data$performance <- data$potential - data$overall
+data |> ggplot(aes(x = age, y = performance)) +
+  geom_point(aes(color = age_group), alpha = 0.5) +
+  labs(title = "So Sánh Performance giữa Các Nhóm Tuổi", x = "Tuổi", y = "Performance") +
+  theme_minimal() 
+```
+<br><br>
+
+- Hiệu suất của cầu thủ giảm dần theo độ tuổi, đặc biệt là ở nhóm tuổi 30+. <br>
+- Nhóm U20: Có Performance cao nhất, cho thấy tiềm năng phát triển còn rất lớn. <br>
+- Nhóm 20-25: Performance vẫn ở mức khá, nhưng đã bắt đầu có dấu hiệu thu hẹp khoảng cách giữa tiềm năng và khả năng hiện tại.<br>
+- Nhóm 25-30: Performance giảm mạnh, cho thấy cầu thủ gần đạt ngưỡng tiềm năng tối đa. <br>
+- Nhóm 30+: Gần như không còn Performance đáng kể, tiềm năng phát triển đã cạn kiệt. <br>
+Tiềm năng phát triển lớn nhất nằm ở U20, trong khi cầu thủ 30+ nên tập trung vào vai trò ổn định và chiến lược.<br>
+
+# 4. A/B Testing
+
+## 4.1 Thực hiện kiểm tra có sự khác biệt nào về điểm overall giữa những người thuận chân trái và phải hay không
+```{r}
+data_foot <- data |> 
+    select(preferred_foot, overall) |> 
+    filter(!is.na(preferred_foot))
+
+```
+### 4.1.1 Đếm số người thuận chân phải
+```{r}
+right_foot_count <- data_foot |> 
+    filter(as.numeric(preferred_foot) == 1) |> 
+    summarize(count = n())
+right_foot_count
+```
+### 4.1.2 Đếm số người thuận chân trái
+```{r}
+left_foot_count <- data_foot |> 
+    filter(as.numeric(preferred_foot) == 0) |> 
+    summarize(count = n())
+left_foot_count
+```
+### 4.1.3 Hàm thực hiện xáo trộn dữ liệu
+```{r}
+perm_fun <- function(x, y, nA, nB, R) {
+  n <- nA + nB
+  mean_diff <- numeric(R)
+  for (i in 1:R){
+    idx_a <- sample(x = 1:n, size = nA)
+    idx_b <- setdiff(x = 1:n, y = idx_a)
+    mean_diff[i] <- mean(y[idx_a]) - mean(y[idx_b])
+  }
+  return(mean_diff)
+}
+
+```
+### 4.1.4 Kiểm tra giả thuyết
+```{r}
+set.seed(21)
+
+diff_mean_perm <- perm_fun(data_foot$preferred_foot, y = data_foot$overall, nA = length(left_foot_count), nB = length(right_foot_count), R = 1000)
+mean_a <- mean(data_foot$overall[data_foot$preferred_foot == 0])
+mean_b <- mean(data_foot$overall[data_foot$preferred_foot == 1])
+p_value<-mean(diff_mean_perm > (mean_a - mean_b))
+p_value
+```
+* p-value = 0, ta bác bỏ giả thuyết H0
+* overall của nhóm cầu thủ thuận chân trái thực sự cao hơn overall của nhóm cầu thủ thuận chân phải
+## Thực hiện kiểm tra xem có sự khác biệt có ý nghĩa thống kê nào về giá trị thị trường giữa các nhóm vị trí cầu thủ hay không
+
+## 4.2 Thực hiện kiểm tra xem có sự khác biệt có ý nghĩa thống kê nào về giá trị thị trường giữa các nhóm vị trí cầu thủ hay không
+
+### 4.2.1 Tạo cột mới 'role' để phân nhóm theo vị trí
+
+```{r}
+data <- data|>
+  mutate(role = case_when(
+    position %in% c("ST", "LF", "CF", "RF", "LW", "RW", "RS", "LS") ~ "attack",
+    position %in% c("CAM", "CM", "LM", "RM", "CDM", "RCM", "LCM", "LDM", "RM", "LAM", "RDM", "RAM") ~ "midfielder",
+    position %in% c("CB", "RB", "LB", "RWB", "LWB", "RCB", "LCB") ~ "defender",
+    position == "GK" ~ "goal_keeper",
+  ))
+data <- data |>
+  mutate(role=factor(role))
+glimpse(data)
+
+```
+### 4.2.2 Lọc N/A
+```{r}
+data_anova <- data |> filter(!is.na(value_km) & !is.na(role))
+out_aov_1 <- aovp(formula = value_km ~ role, data = data_anova, perm = "Prob")
+summary(out_aov_1)
+```
+- Vì p_value < 2.2e-16 cho thấy có sự khác biệt có ý nghĩa thống kê giữa giá trị thị trường giữa các nhóm vị trí cầu thủ. <br>
+```{r}
+ggplot(data_anova, aes(x = role, y = value_km)) +
+  geom_boxplot(fill = "lightblue", color = "darkblue") +
+  labs(title = "Giá trị thị trường trung bình theo nhóm vị trí", x = "Nhóm vị trí", y = "Giá trị thị trường (k€)") +
+  theme_minimal()
+```
+
+### 4.2.3 Sử dụng phương pháp Tukey để chỉ rõ sự khác biệt:
+```{r}
+tukey_result <- TukeyHSD(aov(value_km ~ role, data = data_anova))
+tukey_result
+```
+- p-value của cặp midfielder-attack lớn hơn 0.05 nên sự khác biệt không có ý nghĩa thống kê. <br>
+- defender-attack: defender có giá trị thị trường trung bình thấp hơn attack khoảng 1009017.9 €. <br>
+- goal_keeper-attack: goal_keeper có giá trị thị trường trung bình thấp hơn attack khoảng 1398341.1 €. <br>
+- goal_keeper-defender: goal_keeper có giá trị thị trường trung bình thấp hơn defender khoảng 389323.3 €. <br>
+- midfielder-defender: midfielder có giá trị thị trường trung bình cao hơn defender khoảng 785501.0 €. <br>
+- midfielder-goal_keeper: midfielder có giá trị thị trường trung bình cao hơn goal_keeper khoảng 1174824.3 €. <br>
+
+## 4.3 Thực hiện kiểm tra xem có sự khác biệt có ý nghĩa thống kê nào về giá trị thị trường giữa các nhóm tuổi cầu thủ hay không
+```{r}
+set.seed(21)
+out_aov_2 <- aovp(formula = value_km ~ age_group, data = data, perm = "Prob")
+summary(out_aov_2)
+```
+- Vì p_value< 2.2e-16 cho thấy có sự khác biệt có ý nghĩa thống kê giữa giá trị thị trường giữa các nhóm tuổi.<br>
+```{r}
+ggplot(data, aes(x = age_group, y = value_km)) +
+  geom_boxplot(fill = "lightblue", color = "darkblue") +
+  labs(title = "Giá trị thị trường trung bình theo nhóm tuổi", x = "Nhóm tuổi", y = "Giá trị thị trường (k€)") +
+  theme_minimal()
+
+```
+<br><br>
+
+### 4.3.1 Sử dụng phương pháp Tukey để chỉ rõ sự khác biệt:
+
+```{r}
+tukey_result_3 <- TukeyHSD(aov(value_km ~ age_group, data = data))
+tukey_result_3
+```
+- p-value của cặp 30+-20_25 có giá trị lớn hơn 0.05 nên không có ý nghĩa thống kê. <br>
+- 20_25-U20: Nhóm 20_25 có giá trị thị trường cao hơn nhóm U20 khoảng 1669512.5 đơn vị. <br>
+- 25_30-U20: Nhóm 25_30 có giá trị thị trường cao hơn nhóm U20 khoảng 2575531.4 đơn vị. <br>
+- 30+-U20: Nhóm 30+ có giá trị thị trường cao hơn nhóm U20 khoảng 1416912.1 đơn vị. <br>
+- 25_30-20_25: Nhóm 25_30 có giá trị thị trường cao hơn nhóm 20_25 khoảng 906018.9 đơn vị. <br>
+- 30+-25_30: Nhóm 30+ có giá trị thị trường thấp hơn nhóm 25_30 khoảng 1158619.4 đơn vị. <br>
+
+## 4.4 Tính chỉ số roi (hiệu suất thu được so với chi phí bỏ ra) của các cầu thủ
+```{r}
+data$roi<- (data$overall + data$potential) / (data$wage_k + data$value_km) * 100
+set.seed(21)
+data_filt <-data[!is.infinite(data$roi), ]
+
+out_aov_4 <- aovp(formula = roi ~ age_group, data = data_filt, perm = "Prob")
+summary(out_aov_4)
+```
+- Vì p_value < 2.2e-16 cho thấy có sự khác biệt có ý nghĩa thống kê của giá trị roi giữa các nhóm tuổi. <br>
+```{r}
+
+ggplot(data_filt, aes(x = age_group, y = roi)) +
+  geom_boxplot(fill = "lightblue", color = "darkblue") +
+  labs(title = "Giá trị roi trung bình theo nhóm tuổi", x = "Nhóm tuổi", y = "roi") +
+  theme_minimal()
+
+```
+
+## 4.4.1 Sử dụng phương pháp Tukey để chỉ rõ sự khác biệt:
+```{r}
+tukey_result_4 <- TukeyHSD(aov(roi ~ age_group, data = data_filt))
+tukey_result_4
+```
+
+- p-value giữa cặp 30+-U20 có giá trị lớn hơn 0.05 nên không có ý nghĩa thống kê. <br>
+- 20_25-U20: Nhóm 20_25 có giá trị roi thấp hơn nhóm U20 khoảng 0.03870533 đơn vị. <br>
+- 25_30-U20: Nhóm 25_30 có giá trị roi thấp hơn nhóm U20 khoảng 0.05009051 đơn vị. <br>
+- 25_30-20_25: Nhóm 25_30 có giá trị roi thấp hơn nhóm 20_25 khoảng 0.01138518 đơn vị. <br>
+- 30+-20_25: Nhóm 30+ có giá trị roi cao hơn nhóm 20_25 khoảng 0.05302935 đơn vị. <br>
+- 30+-25_30: Nhóm 30+ có giá trị roi cao hơn nhóm 25_30 khoảng 0.06441453 đơn vị. <br>
+
+## 4.5 So sánh performance giữa các nhóm tuổi
+```{r}
+ggplot(data, aes(x = age_group, y = performance, fill = age_group)) +
+  geom_boxplot() +
+  labs(
+    title = "Comparison of Potential Between U20 and U30-U50 Age Groups",
+    x = "Age Group",
+    y = "Performace"
+  ) +
+  theme_minimal()
+
+```
+```{r}
+out_aov_5 <- aovp(formula = performance ~ age_group, data = data, perm = "Prob")
+summary(out_aov_5)
+```
+- Vì p_value< 2.2e-16 cho thấy có sự khác biệt giữa giá trị performace giữa các nhóm tuổi. <br>
+
+## 4.5.1 Sử dụng phương pháp Tukey để chỉ rõ sự khác biệt:
+
+```{r}
+
+tukey_result_5 <- TukeyHSD(aov(performance ~ age_group, data = data))
+tukey_result_5
+```
+- p-value giữa các cặp so sánh đều có giá trị nhỏ hơn 0.05 nên sự khác biệt này có ý nghĩa thống kê. <br>
+- 20_25-U20: Nhóm 20_25 có giá trị performace thấp hơn nhóm U20 khoảng 7.8995419 đơn vị. <br>
+- 25_30-U20: Nhóm 25_30 có giá trị performace thấp hơn nhóm U20 khoảng 14.4102258 đơn vị. <br>
+- 30+-U20: Nhóm 30+ có giá trị performace thấp hơn nhóm U20 khoảng 15.0531864 đơn vị. <br>
+- 25_30-20_25: Nhóm 25_30 có giá trị performace thấp hơn nhóm 20_25 khoảng 6.5106840 đơn vị. <br>
+- 30+-20_25: Nhóm 30+ có giá trị performace thấp hơn nhóm 20_25 khoảng 7.1536445 đơn vị. <br>
+- 30+-25_30: Nhóm 30+ có giá trị performace thấp hơn nhóm 25_30 khoảng 0.6429606 đơn vị. <br>
+
+# 5. Mô hình hồi quy với release_clause_km
+```{r}
+data_null_release_clause_km <- data |> filter(is.na(release_clause_km))
+data_filter_release_clause_km<- data[sapply(data,function(col) !is.character(col))]
+data_filter_release_clause_km$contract_duration <- as.numeric(difftime(data_filter_release_clause_km$contract_valid_until, data_filter_release_clause_km$joined, units = "days")) / 365
+data_filter_release_clause_km$contract_duration <- round(data_filter_release_clause_km$contract_duration)
+data_filter_release_clause_km<- data_filter_release_clause_km[, !(names(data_filter_release_clause_km) %in% c("id","age_group","role","contract_valid_until","loaned_from","joined","performance"))]
+data_filter_release_clause_km <- data_filter_release_clause_km |>
+  filter(!is.na(release_clause_km) & release_clause_km > 0)
+glimpse(data_filter_release_clause_km)
+data_filter_release_clause_km<-na.omit(data_filter_release_clause_km)
+sum(is.na(data_filter_release_clause_km))
+
+```
+## 5.1 Xây dựng mô hình
+```{r}
+hist(data_filter_release_clause_km$release_clause_km, main = "Histogram of release_clause_km", xlab = "Values", breaks = 30)
+
+```
+<br><br>
+
+- Dữ liệu của biến release_clause_km bị lệch phải nên ta sẽ sử dụng mô hình Generalized linear model với phân phối Gamma để lựa chọn mô hình. <br>
+```{r}
+glm_gamma <- glm(release_clause_km ~ ., family = Gamma(link = "log"), data = data_filter_release_clause_km)
+
+```
+## 5.2 Lựa chọn mô hình 
+```{r}
+summary(glm_gamma)
+
+```
+- Ta sẽ chọn các biến có ý nghĩa thống kê cao (17 biến): age, overall, potential, value_km,
+wage_k, international_reputation, skill_moves, jersey_number, height_m, heading_accuracy,
+reactions, strength, aggression, penalties, marking, roi, contract_duration. <br>
+```{r}
+md_glm <- glm(release_clause_km ~ age+ overall+ potential+ value_km+
+              wage_k+ international_reputation+ skill_moves+ jersey_number+ height_m + heading_accuracy+ 
+               reactions+ strength+ aggression+ penalties+ marking+ roi+ contract_duration , family = Gamma(link = "log"), data = data_filter_release_clause_km)
+summary(md_glm)
+
+```
+
+## 5.3 Chuẩn đoán mô hình
+
+### 5.3.1 Kiểm tra điểm ngoại lai trong mô hình:
+```{r}
+ggplot(md_glm, aes(.hat, .stdresid)) +
+  geom_point(aes(size = .cooksd)) +
+  xlab("Leverage") + ylab("Standardized Residuals") +
+  scale_size_continuous("Cook's Distance", range = c(1, 6)) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+
+```
+```{r}
+
+std_resid_md_glm <- rstandard(md_glm)
+hat_values_md_glm <- hatvalues(md_glm)
+cooks_D_md_glm <- cooks.distance(md_glm)
+data_cooks_md_glm <- tibble(id_point = 1:nrow(data_filter_release_clause_km),
+                            rstand = std_resid_md_glm, hats = hat_values_md_glm,
+                            cooks = cooks_D_md_glm, sales = data_filter_release_clause_km$release_clause_km)
+```
+
+```{r}
+data_cooks_md_glm |> arrange(desc(cooks))
+data_outliers_md_glm <- data_cooks_md_glm |>
+  filter(cooks > 0.5)
+
+
+```
+```{r}
+outlier_points_md_glm <- data_cooks_md_glm |>
+  slice(data_outliers_md_glm$id_point)
+outlier_points_md_glm
+```
+- Các giá trị ngoại lai không có ảnh hưởng lớn tới mô hình. <br>
+
+### 5.3.2 Kiểm tra hiện tượng đa cộng tuyến
+```{r}
+vif(md_glm)
+
+```
+- Xảy ra hiện tượng đa cộng tuyến, nên ta tiến hành loại bỏ biến (overall) để giải quyết tình trạng đa cộng tuyến. <br>
+```{r}
+md_glm <- glm(release_clause_km ~ age+ potential+ value_km+
+                  wage_k+ international_reputation+ skill_moves+ jersey_number+ height_m+ heading_accuracy+ 
+                  reactions+ strength+ aggression+ penalties+ marking+ roi+ contract_duration, family = Gamma(link = "log"), data = data_filter_release_clause_km)
+
+```
+- Ta kiểm tra lại có còn hiện tượng đa cộng tuyến hay không. <br>
+```{r}
+vif(md_glm)
+
+```
+- Đã loại bỏ được hiện tượng đa cộng tuyến. <br>
+
+### 5.3.3 Đánh giá hiệu xuất mô hình
+```{r}
+cat("BIC: ", BIC(glm_gamma), "\n")
+cat("AIC: ", AIC(glm_gamma), "\n")
+cat("BIC: ", BIC(md_glm), "\n")
+cat("AIC: ", AIC(md_glm), "\n")
+```
+- Ta nhận thấy có sự cải thiện về chỉ số AIC và BIC của mô hình mới sau khi đã xử lý các vấn đề đa cộng tuyến, loại bỏ các biến không có ý nghĩa thống kê cao. <br>
+
+### 5.3.4 Kiểm tra sự phù hợp của mô hình
+```{r}
+p_value <- 1 - pchisq(md_glm$deviance, df.residual(md_glm))
+p_value
+```
+- p-value=1 cho thấy mô hình hoàn toàn phù hợp. <br>
+
+# 6. Mô hình hồi quy với value_km
+```{r}
+data_null_value_km <- data |> filter(is.na(value_km))
+data_null_value_km
+data_filter_value_km<- data[sapply(data,function(col) !is.character(col))]
+data_filter_value_km$contract_duration <- as.numeric(difftime(data_filter_value_km$contract_valid_until, data_filter_value_km$joined, units = "days")) / 365
+data_filter_value_km$contract_duration <- round(data_filter_value_km$contract_duration)
+data_filter_value_km<- data_filter_value_km[, !(names(data_filter_value_km) %in% c("id","age_group","role","contract_valid_until","loaned_from","joined","performance"))]
+data_filter_value_km <- data_filter_value_km |>
+  filter(!is.na(value_km) & value_km > 0)
+glimpse(data_filter_value_km)
+data_filter_value_km<-na.omit(data_filter_value_km)
+sum(is.na(data_filter_value_km))
+
+
+```
+## 6.1 xây dựng mô hình hồi quy
+```{r}
+hist(data_filter_value_km$value_km, main = "Histogram of value_km", xlab = "Values", breaks = 30)
+
+```
+<br><br>
+
+- Dữ liệu của biến value_km bị lệch phải nên ta sẽ sử dụng mô hình Generalized linear model với phân phối Gamma để lựa chọn mô hình. <br>
+```{r}
+glm_gamma_value_km <- glm(value_km ~ ., family = Gamma(link = "log"), data = data_filter_value_km)
+
+```
+## 6.2 lựa chọn mô hình
+```{r}
+summary(glm_gamma_value_km)
+
+```
+- Ta sẽ chọn các biến có ý nghĩa thống kê cao (17 biến): age, overall, preferred_foot, skill_moves, crossing, finishing, volleys, fk_accuracy, long_passing, ball_control, reactions, stamina, positioning, marking, release_clause_km, roi, contract_duration. <br>
+```{r}
+md_glm_value_km <- glm(value_km ~ age+ overall+ preferred_foot+ skill_moves+ crossing+ finishing+ volleys+ 
+                       fk_accuracy+ long_passing+ ball_control+ reactions+ stamina+ positioning+ marking+ release_clause_km+ roi+ contract_duration, family = Gamma(link = "log"), data = data_filter_value_km)
+summary(md_glm_value_km)
+
+```
+##  6.3 Chuẩn đoán mô hình
+### 6.3.1 Kiểm tra các điểm ngoại lai của mô hình
+```{r}
+ggplot(md_glm_value_km, aes(.hat, .stdresid)) +
+  geom_point(aes(size = .cooksd)) +
+  xlab("Leverage") + ylab("Standardized Residuals") +
+  scale_size_continuous("Cook's Distance", range = c(1, 6)) +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+```
+
+```{r}
+std_resid_md_glm_value_km <- rstandard(md_glm_value_km)
+hat_values_md_glm_value_km <- hatvalues(md_glm_value_km)
+cooks_D_md_glm_value_km <- cooks.distance(md_glm_value_km)
+data_cooks_md_glm_value_km <- tibble(id_point = 1:nrow(data_filter_value_km),
+                                     rstand = std_resid_md_glm_value_km, hats = hat_values_md_glm_value_km,
+                                     cooks = cooks_D_md_glm_value_km, sales = data_filter_value_km$value_km)
+data_cooks_md_glm_value_km |> arrange(desc(cooks))
+data_outliers_md_glm_value_km <- data_cooks_md_glm |>
+  filter(cooks > 0.5)
+outlier_points_md_glm_value_km <- data_cooks_md_glm_value_km |>
+  slice(data_outliers_md_glm_value_km$id_point)
+outlier_points_md_glm_value_km
+```
+
+- Các giá trị ngoại lai không có ảnh hưởng lớn tới mô hình. <br>
+
+### 6.3.2 Kiểm tra tính đa cộng tuyến tính
+```{r}
+vif(md_glm_value_km)
+
+```
+- Xảy ra hiện tượng đa cộng tuyến, nên ta tiến hành loại bỏ biến để giải quyết tình trạng đa cộng tuyến. <br>
+
+```{r}
+md_glm_value_km <- glm(value_km ~ age+ overall+ preferred_foot+ skill_moves+ crossing+ finishing+ volleys+ 
+                         fk_accuracy+ long_passing+ reactions+ stamina+ marking+ release_clause_km+ roi+ contract_duration, family = Gamma(link = "log"), data = data_filter_value_km)
+```
+- Ta kiểm tra lại có còn hiện tượng đa cộng tuyến hay không. <br>
+```{r}
+vif(md_glm_value_km)
+
+```
+```{r plot-overall-value, echo=FALSE, fig.width=10, fig.height=6}
+# Biểu đồ tương quan giữa 2 biến value_km và overall
+ggplot(data_filter_value_km, aes(x = overall, y = value_km)) +
+  geom_point(alpha = 0.6, size = 2) +
+  geom_smooth(method = "loess", se = FALSE, color = "black", linetype = "dashed") +
+  labs(
+    title = "Tương Quan Giữa Overall và Value_km",
+    x = "Overall",
+    y = "Value_km"
+  ) +
+  theme_minimal()
+
+
+```
+- Biến overall có tương quan cao với value_km nhưng nó có ý nghĩa thực tiễn quan trọng trong mô hình, đồng thời chúng ta sử dụng mô hình generalized linear model nên không cần thiết loại bỏ biến overall. <br> 
+- 1 số biến có chỉ số VIF không quá cao nên ta sẽ không loại bỏ các biến đó, giảm được hiện tượng đa cộng tuyến. <br>
+
+### 6.3.3 Đánh giá hiệu suất mô hình
+```{r}
+cat("BIC: ", BIC(md_glm_value_km), "\n")
+cat("AIC: ", AIC(md_glm_value_km), "\n")
+```
+- Các chỉ số BIC và AIC khá cao. <br>
+
+### 6.3.4 Kiểm tra sự phù hợp của mô hình
+```{r}
+p_value <- 1 - pchisq(md_glm_value_km$deviance, df.residual(md_glm))
+p_value
+```
+- p-value=1 cho thấy mô hình hoàn toàn phù hợp. <br>
+
+# 7. Mô hình phân loại
+
+## 7.1 Phân loại theo role
+```{r}
+sum(is.na(data$short_passing))
+```
+- Kiểm tra các dòng có chỉ số null, vì 1 chỉ số null nên tất cả đều null dựa trên biểu đồ khuyết. <br>
+```{r}
+data_class_role <- data |> filter(!is.na(short_passing))
+glimpse(data_class_role)
+data_class_role <- data_class_role |> select(where(~!is.character(.)))
+data_class_role <- data_class_role |>
+  select(
+    -id,
+    -joined,
+    -contract_valid_until,
+    -age_group,
+    -roi,
+    -performance,
+    -jersey_number,
+    -release_clause_km,
+    -value_km,
+    -wage_k
+  )
+
+```
+
+### 7.1.1 Data test
+
+```{r}
+test_set_role <- data_class_role |> 
+  filter(is.na(role)) |> 
+  select(-role)
+```
+- Data test dựa trên những cầu thủ có position null nhưng các chỉ số không null. <br>
+
+### 7.1.2 Data train
+```{r}
+data_class_role_train <- data_class_role |> 
+  filter(!is.na(role))
+```
+- Data train dựa trên những cầu thủ có đầy đủ các chỉ số. <br>
+
+### 7.1.3 Train model
+```{r}
+out_md_class <- multinom(role ~ ., data = data_class_role,
+                         maxit = 1500)
+
+```
+### 7.1.4 Predict
+```{r}
+test_set_preds <- predict(out_md_class, test_set_role, type = "class")
+test_set_preds
+
+```
+### 7.1.5 Đánh giá mô hình
+```{r}
+pred_class_test <- predict(out_md_class, type = "class")
+conf_matrix_test <- table(data_class_role_train$role, pred_class_test)
+conf_matrix_test
+```
+### 7.1.6 Hàm xuất ra các độ đo đánh giá 1 mô hình phân loại
+```{r}
+eval_multi_class <- function(x) {
+    cc <- sum(diag(x))
+    sc <- sum(x)
+    pp <- colSums(x)
+    tt <- rowSums(x)
+    ##
+    prec <- diag(x)/colSums(x)
+    recall <- diag(x)/rowSums(x)
+    macro_prec <- mean(prec)
+    macro_recall <- mean(recall)
+    macro_f1 <- 2 * macro_prec * macro_recall/(1/macro_prec + 1/macro_recall)
+    acc <- cc/sc
+    kap <- (cc * sc - sum(pp * tt))/(sc^2 - sum(pp * tt))
+    return(list(Precision = prec, Recall = recall, Accuracy = acc, Kappa = kap,
+                Macro_F1 = macro_f1))
+}
+eval_multi_class(conf_matrix_test)
+
+```
+
+```{r}
+role_count <- data_class_role_train |> 
+  group_by(role) |> 
+  summarise(count = n()) |> 
+  arrange(desc(count))
+role_count
+
+```
+
+- Nhận thấy có sự mất cân bằng dữ liệu giữa các nhóm, nên ta sử dụng phương pháp over sampling. <br>
+
+### 7.1.7 Hàm over sampling
+```{r}
+over_sampling_2c <- function(data, name_class) {
+  # Sao chép dữ liệu gốc
+  new_data <- data
+  
+  # Chuyển cột lớp mục tiêu thành factor
+  class_fact <- as.factor(data[[name_class]])
+  
+  # Tách dữ liệu theo từng lớp
+  data_split <- split(data, class_fact)
+  
+  # Đếm số lượng mẫu của mỗi lớp
+  n_class <- sapply(data_split, FUN = nrow)
+  n_major <- max(n_class) # Số lượng lớp chiếm đa số
+  
+  # Tạo dữ liệu cân bằng
+  balanced_data <- do.call(rbind, lapply(names(data_split), function(class_name) {
+    class_data <- data_split[[class_name]]
+    n_current <- nrow(class_data)
+    
+    # Kiểm tra nếu lớp cần over-sampling
+    if (n_current < n_major) {
+      id_minor <- sample(1:n_current, size = n_major, replace = TRUE)
+      class_data <- class_data[id_minor, ]
+    }
+    
+    return(class_data)
+  }))
+  
+  # Trả về dữ liệu đã cân bằng
+  return(balanced_data)
+}
+
+
+```
+### 7.1.8 Áp dụng hàm over-sampling
+```{r}
+set.seed(123)
+data_balanced <- over_sampling_2c(data_class_role_train, "role")
+
+```
+
+### 7.1.9 Kiểm tra phân phối lớp sau khi Over-Sampling
+```{r}
+role_count_balanced <- data_balanced |> 
+  group_by(role) |> 
+  summarise(count = n()) |> 
+  arrange(desc(count))
+print(role_count_balanced)
+```
+
+### 7.1.10 Train model sau khi over-sampling
+```{r}
+out_md_class_after <- multinom(role ~ ., data = data_balanced,
+                         maxit = 1500)
+
+```
+### 7.1.11 Predict
+```{r}
+test_set_preds_after <- predict(out_md_class_after, test_set_role, type = "class")
+test_set_preds_after
+
+```
+### 7.1.12 Đánh giá mô hình
+```{r}
+pred_class_test_after <- predict(out_md_class_after, type = "class")
+conf_matrix_test <- table(data_balanced$role, pred_class_test_after)
+eval_multi_class(conf_matrix_test)
+
+```
+- Độ chính xác tăng, có sự điều chỉnh đáng kể ở 2 vị trí attack và midfielder. <br>
+
+### 7.1.13 Thêm cột role vào dữ liệu data test
+```{r}
+test_set_role$role <- test_set_preds
+test_set_role
+```
+## 7.2 Hàm over sampling tinh chỉnh
+```{r}
+over_sampling_2c_x3 <- function(data, name_class) {
+  # Sao chép dữ liệu gốc
+  new_data <- data
+  
+  # Chuyển cột lớp mục tiêu thành factor
+  class_fact <- as.factor(data[[name_class]])
+  
+  # Tách dữ liệu theo từng lớp
+  data_split <- split(data, class_fact)
+  
+  # Đếm số lượng mẫu của mỗi lớp
+  n_class <- sapply(data_split, FUN = nrow)
+  n_major <- max(n_class) # Số lượng lớp chiếm đa số
+  n_minor <- min(n_class) # Số lượng lớp chiếm thiểu số
+  
+  # Tạo dữ liệu cân bằng với ngưỡng giới hạn
+  balanced_data <- do.call(rbind, lapply(names(data_split), function(class_name) {
+    class_data <- data_split[[class_name]]
+    n_current <- nrow(class_data)
+    
+    if (n_current <= n_minor) {
+      # Over-sampling cho lớp cực nhỏ
+      id_sample <- sample(1:n_current, size = 100, replace = TRUE)
+      class_data <- class_data[id_sample, ]
+      
+    } else if (n_current > n_minor & n_current < 90) {
+      # Over-sampling đến 90 mẫu nếu lớp nhỏ hơn 90
+      id_sample <- sample(1:n_current, size = 150, replace = TRUE)
+      class_data <- class_data[id_sample, ]
+      
+    } else if (n_current >= 90 & n_current < 100) {
+      # Over-sampling đến 100 mẫu nếu lớp nằm giữa 90 và 100
+      id_sample <- sample(1:n_current, size = 200, replace = TRUE)
+      class_data <- class_data[id_sample, ]
+      
+    } else if (n_current >= 100 & n_current < 500) {
+      # Over-sampling đến 500 mẫu cho lớp trung bình
+      id_sample <- sample(1:n_current, size = 250, replace = TRUE)
+      class_data <- class_data[id_sample, ]
+      
+    } else if (n_current >= 500 & n_current < 1000) {
+      # Under-sampling hoặc điều chỉnh nhẹ
+      id_sample <- sample(1:n_current, size = 350, replace = FALSE)
+      class_data <- class_data[id_sample, ]
+      
+    } else {
+      # Under-sampling cho lớp quá lớn
+      id_sample <- sample(1:n_current, size = 400, replace = FALSE)
+      class_data <- class_data[id_sample, ]
+    }
+    
+    return(class_data)
+  }))
+  
+  # Trả về dữ liệu đã cân bằng
+  return(balanced_data)
+}
+
+
+```
+## 7.3 Dự đoán các vị trí cụ thể bằng hàm over-sampling gốc
+### 7.3.1 Dự đoán các vị trí cụ thể trong attack
+```{r}
+data_class_position <- data |> filter(!is.na(short_passing)) 
+data_class_position <- data_class_position |> 
+  select(position, where(~ !is.character(.)) | all_of("position"))
+data_class_position <- data_class_position |>
+  select(
+    -id,
+    -joined,
+    -contract_valid_until,
+    -age_group,
+    -roi,
+    -performance,
+    -jersey_number,
+    -release_clause_km,
+    -value_km,
+    -wage_k,
+    -age,
+    -overall,
+    -potential,
+    -international_reputation
+  )
+
+data_class_position_attack <- data_class_position |> filter(!is.na(position)) |> filter(role == "attack")
+test_set_role_attack <- test_set_role |> filter(role == "attack")
+data_class_position_attack <- data_class_position_attack |>
+  select(-role) 
+data_class_position_attack$position <- as.factor(data_class_position_attack$position)
+test_set_role_attack <- test_set_role_attack |>
+  select(-role)
+
+```
+
+#### Kiểm tra số lượng cầu thủ trong mỗi vị trí
+```{r}
+position_count <- data_class_position_attack |> 
+  group_by(position) |> 
+  summarise(count = n()) |> 
+  arrange(desc(count))
+position_count
+```
+#### Oversampling
+```{r}
+position_attack_balanced <- over_sampling_2c(data_class_position_attack, "position")
+
+```
+#### Kiểm tra phân phối lớp sau khi Over-Sampling
+```{r}
+position_count_balanced <- position_attack_balanced |> 
+  group_by(position) |> 
+  summarise(count = n()) |> 
+  arrange(desc(count))
+position_count_balanced
+```
+#### Train model
+```{r}
+out_md_position_attack <- multinom(position ~ ., data = position_attack_balanced,
+                                   maxit = 1500)
+```
+#### Predict 
+```{r}
+test_set_preds_position_attack <- predict(out_md_position_attack, test_set_role_attack, type = "class")
+test_set_preds_position_attack
+```
+
+#### Đánh giá mô hình
+```{r}
+pred_class_test_attack <- predict(out_md_position_attack, type = "class")
+conf_matrix_test <- table(position_attack_balanced$position, pred_class_test_attack)
+eval_multi_class(conf_matrix_test)
+```
+
+
+### 7.3.2 Dự đoán các vị trí cụ thể trong midfielder
+```{r}
+data_class_position_midfielder <- data_class_position |> filter(!is.na(position)) |> filter(role == "midfielder")
+test_set_role_midfielder <- test_set_role |> filter(role == "midfielder")
+data_class_position_midfielder <- data_class_position_midfielder |>
+  select(-role) 
+data_class_position_midfielder$position <- as.factor(data_class_position_midfielder$position)
+test_set_role_midfielder <- test_set_role_midfielder |>
+  select(-role)
+
+```
+#### Kiểm tra số lượng cầu thủ trong mỗi vị trí
+```{r}
+position_count <- data_class_position_midfielder |> 
+  group_by(position) |> 
+  summarise(count = n()) |> 
+  arrange(desc(count))
+position_count
+
+```
+#### Over-sampling
+```{r}
+position_midfielder_balanced <- over_sampling_2c(data_class_position_midfielder, "position")
+
+```
+#### Kiểm tra phân phối lớp sau khi Over-Sampling
+
+```{r}
+position_count_balanced <- position_midfielder_balanced |> 
+  group_by(position) |> 
+  summarise(count = n()) |> 
+  arrange(desc(count))
+position_count_balanced
+```
+#### Train model 
+```{r}
+out_md_position_midfielder <- multinom(position ~ ., data = position_midfielder_balanced,
+                                       maxit = 1500)
+```
+#### Predict
+```{r}
+test_set_preds_position_midfielder <- predict(out_md_position_midfielder, test_set_role_midfielder, type = "class")
+test_set_preds_position_midfielder
+
+```
+#### Đánh giá mô hình
+```{r}
+pred_class_test_midfielder <- predict(out_md_position_midfielder, type = "class")
+conf_matrix_test <- table(position_midfielder_balanced$position, pred_class_test_midfielder)
+eval_multi_class(conf_matrix_test)
+```
+
+### 7.3.3 Dự đoán mô hình cụ thể trong defender
+```{r}
+data_class_position_defender <- data_class_position |> filter(!is.na(position)) |> filter(role == "defender")
+test_set_role_defender <- test_set_role |> filter(role == "defender")
+data_class_position_defender <- data_class_position_defender |>
+  select(-role) 
+data_class_position_defender$position <- as.factor(data_class_position_defender$position)
+test_set_role_defender <- test_set_role_defender |>
+  select(-role)
+```
+#### Kiểm tra số lượng cầu thủ trong mỗi vị trí
+```{r}
+position_count <- data_class_position_defender |> 
+  group_by(position) |> 
+  summarise(count = n()) |> 
+  arrange(desc(count))
+position_count
+```
+#### Over-sampling
+```{r}
+position_defender_balanced <- over_sampling_2c(data_class_position_defender, "position")
+```
+
+#### Kiểm tra phân phối lớp sau khi Over-Sampling
+```{r}
+position_count_balanced <- position_defender_balanced |> 
+  group_by(position) |> 
+  summarise(count = n()) |> 
+  arrange(desc(count))
+position_count_balanced
+```
+
+#### Train model 
+```{r}
+out_md_position_defender <- multinom(position ~ ., data = position_defender_balanced,
+                                     maxit = 1500)
+
+```
+#### Predict
+```{r}
+test_set_preds_position_defender <- predict(out_md_position_defender, test_set_role_defender, type = "class")
+test_set_preds_position_defender
+```
+
+#### Đánh giá mô hình
+```{r}
+pred_class_test_defender <- predict(out_md_position_defender, type = "class")
+conf_matrix_test <- table(position_defender_balanced$position, pred_class_test_defender)
+eval_multi_class(conf_matrix_test)
+
+```
+- Có thể thấy Macro_F1 trong mô hình dự đoán vị trí cụ thể bị quá thấp bởi vì bị chêch lệch dữ liệu quá lớn khi sử dụng over-sampling thhì sẽ có trường hợp những vị trí có số lượng mẫu thấp bị học lại nhhiều lần dẫn tới mô hình bị hiện tưởng quá khớp với một ví trí trong mô hình. Vì vậy, hàm over-sampling được tinh chỉnh lại giảm số lượng mẫu khi sampling lại để mẫu nhỏ nhất không bị lặp lại quá nhiều lần nhưng vẫn không mất đi tính tổng quát của dữ liệu. <br>
+
+## 7.4 Dự đoán mô hình với over-sampling được tinh chỉnh
+
+### 7.4.1 Dự đoán các vị trí cụ thể trong Attack
+
+#### Oversampling
+```{r}
+position_attack_balanced <- over_sampling_2c_x3(data_class_position_attack, "position")
+
+```
+#### Kiểm tra phân phối lớp sau khi Over-Sampling
+```{r}
+position_count_balanced <- position_attack_balanced |> 
+  group_by(position) |> 
+  summarise(count = n()) |> 
+  arrange(desc(count))
+position_count_balanced
+```
+#### Train model
+```{r}
+out_md_position_attack <- multinom(position ~ ., data = position_attack_balanced,
+                                   maxit = 1500)
+```
+```{r}
+test_set_preds_position_attack <- predict(out_md_position_attack, test_set_role_attack, type = "class")
+test_set_preds_position_attack
+```
+
+#### Đánh giá mô hình
+```{r}
+pred_class_test_attack <- predict(out_md_position_attack, type = "class")
+conf_matrix_test <- table(position_attack_balanced$position, pred_class_test_attack)
+eval_multi_class(conf_matrix_test)
+```
+### 7.4.2 Dự đoán các vị trí cụ thể trong midfielder
+#### Over-sampling
+```{r}
+position_midfielder_balanced <- over_sampling_2c_x3(data_class_position_midfielder, "position")
+
+```
+#### Kiểm tra phân phối lớp sau khi Over-Sampling
+
+```{r}
+position_count_balanced <- position_midfielder_balanced |> 
+  group_by(position) |> 
+  summarise(count = n()) |> 
+  arrange(desc(count))
+position_count_balanced
+```
+#### Train model 
+```{r}
+out_md_position_midfielder <- multinom(position ~ ., data = position_midfielder_balanced,
+                                       maxit = 1500)
+```
+#### Predict
+```{r}
+test_set_preds_position_midfielder <- predict(out_md_position_midfielder, test_set_role_midfielder, type = "class")
+test_set_preds_position_midfielder
+
+```
+#### Đánh giá mô hình
+```{r}
+pred_class_test_midfielder <- predict(out_md_position_midfielder, type = "class")
+conf_matrix_test <- table(position_midfielder_balanced$position, pred_class_test_midfielder)
+eval_multi_class(conf_matrix_test)
+```
+### 7.4.3 Dự đoán mô hình cụ thể trong defender
+#### Over-sampling
+```{r}
+position_defender_balanced <- over_sampling_2c_x3(data_class_position_defender, "position")
+```
+
+#### Kiểm tra phân phối lớp sau khi Over-Sampling
+```{r}
+position_count_balanced <- position_defender_balanced |> 
+  group_by(position) |> 
+  summarise(count = n()) |> 
+  arrange(desc(count))
+position_count_balanced
+```
+
+#### Train model 
+```{r}
+out_md_position_defender <- multinom(position ~ ., data = position_defender_balanced,
+                                     maxit = 1500)
+
+```
+#### Predict
+```{r}
+test_set_preds_position_defender <- predict(out_md_position_defender, test_set_role_defender, type = "class")
+test_set_preds_position_defender
+```
+
+#### Đánh giá mô hình
+```{r}
+pred_class_test_defender <- predict(out_md_position_defender, type = "class")
+conf_matrix_test <- table(position_defender_balanced$position, pred_class_test_defender)
+eval_multi_class(conf_matrix_test)
+
+```
+- Sau khi áp dụng hàm over-sampling đã tinh chỉnh để dữ liệu huấn luyện mô hình không quá khớp thì nhận thấy Marco_F1 có gia tăng nhưng không đáng kể. Giải thích cho vấn đề này có thể là một cầu thủ thuộc 1 role (attack, midfielders, defenders) thì có thể chơi ở nhiều position khác nhau trong 1 role (Ví dụ: Cristiano Ronaldo ngoài đá position ST thì Cristiano Ronaldo có thể chuyển qua đá cánh LW hoặc RW tùy theo vị trí sắp xếp của Huấn luyện viên). Đây là lý do khiến cho dữ liệu bị mất cân bằng.
