@@ -1,18 +1,11 @@
 ---
 title: "Project"
-author: "Nhóm 20"
+author: "Anh Thư"
 date: "2025-01-08"
 output: html_document
 ---
 
-# Nhóm 20
-Các thành viên:<br>
-1. Nguyễn Hoàng Yến Nhi - 21110358 <br>
-2. Lê Đặng Gia Khánh - 22110081 <br>
-3. Phạm Đăng Quang - 22110177  <br>
-4. Trần Anh Quốc - 22110178  
-5. Nguyễn Quốc Tài - 22110190  
-6. Phạm Thị Anh Thư - 22110215
+
  
 # Import thư viện cần thiết
 ```{r}
